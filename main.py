@@ -11,17 +11,27 @@ import pymupdf
 json_parse_prompt = "Return the answer in a valid JSON format, with the key '{key}'. DO NOT return any more content, but ONLY the JSON string. Remember to escape double quotes by using backslash (\)."
 
 
-def get_keywords_block(page: pymupdf.Page) -> dict:
-    blocks = page.get_text("blocks", sort=True)
-    text_blocks = [b[4] for b in blocks]
-    for text in text_blocks:
-        m = re.search("[K|k]ey\s?[W|w]ords[\.|:].*", text, flags=re.DOTALL)
+def get_text_block_match(regex_str: str, text_blocks: List[str]) -> str:
+    separator_regex = "[\.|:]?"
+
+    for i in range(len(text_blocks)):
+        m = re.search(
+            regex_str + separator_regex, text_blocks[i].lower(), flags=re.DOTALL
+        )
         if m:
-            return (
-                re.sub("[K|k]ey\s?[W|w]ords[\.|:]", "", m.group())
-                .replace("\n", " ")
-                .strip()
-            )
+            return i, m.start(), m.end()
+
+
+def get_key_value(text_blocks: List[str], i: int, key_start: int, key_end: int) -> str:
+    text = text_blocks[i]
+    if text[key_end:].replace("\n", "").strip() == "":
+        text = text_blocks[i + 1]
+    else:
+        text = text[key_end:]
+    s = re.search("[A-Za-z].*", text, flags=re.DOTALL)
+    if s:
+        return text[s.start() :]
+    return text[key_start:]
 
 
 def max_block_size(block: dict) -> int:
@@ -76,23 +86,20 @@ def clean_json_string(json_string: str) -> str:
     return json_string[init:end]
 
 
-def build_search_string(title: str, keywords: str) -> str:
-    task_prompt = "Here is the title and keywords of a research paper: \nTitle: {title}\n\nKeywords:{keywords}.\n\nBuild a search string to use in a search engine for research papers in order to find relevant papers related to this specific article."
+def build_search_string(title: str, abstract: str, keywords: str) -> str:
+    task_prompt = "Here are the title, abstract and keywords of a research paper: \nTitle: {title}\nAbstract: {abstract}\nKeywords: {keywords}.\n\nBuild a search string to use in a search engine for research papers, in order to find relevant papers related to this specific article."
 
     llm = Ollama(model="llama3")
 
     prompt = (
-        task_prompt.format(title=title, keywords=keywords)
+        task_prompt.format(title=title, abstract=abstract, keywords=keywords)
         + "\n\n"
         + json_parse_prompt.format(key="search_string")
     )
 
     search_string = llm.invoke(prompt)
-
     cleaned = clean_json_string(search_string)
-    data = json.loads(cleaned)
-
-    return data["search_string"].replace('"', "")
+    return cleaned
 
 
 def arxiv_search(search_string: str, max_results: int) -> List[Document]:
@@ -122,13 +129,48 @@ def arxiv_search(search_string: str, max_results: int) -> List[Document]:
 
 if __name__ == "__main__":
     input_path = Path(sys.argv[1])
-    for filepath in input_path.glob("*.pdf"):
-        doc = pymupdf.open(filepath)
-        title = get_block_text(get_title_block(doc[0]))
-        keywords = get_keywords_block(doc[0])
+    abstract_re = "abstract"
+    keywords_re = "key\s?words"
+    output_path = Path("./output")
+    output_path.mkdir(exist_ok=True)
 
+    for filepath in input_path.glob("*.pdf"):
         print("filename:", filepath.name)
+
+        doc = pymupdf.open(filepath)
+        blocks = doc[0].get_text("blocks", sort=True)
+        text_blocks = [b[4] for b in blocks]
+
+        title = get_block_text(get_title_block(doc[0]))
         print("title:", title)
-        print("keywords:", keywords)
-        print("search string:", build_search_string(title, keywords))
+
+        keywords_i, keywords_start, keywords_end = get_text_block_match(
+            keywords_re, text_blocks
+        )
+        keywords_value = get_key_value(
+            text_blocks, keywords_i, keywords_start, keywords_end
+        )
+        print("keywords:", keywords_value)
+
+        abstract_i, abstract_start, abstract_end = get_text_block_match(
+            abstract_re, text_blocks
+        )
+        abstract_value = get_key_value(
+            text_blocks, abstract_i, abstract_start, abstract_end
+        )
+        print("abstract:", abstract_value)
+
+        search_string = build_search_string(
+            title=title, abstract=abstract_value, keywords=keywords_value
+        )
+
+        output_obj = {
+            "title": title,
+            "abstract": abstract_value,
+            "keywords": keywords_value,
+            "search_string": search_string
+        }
         print()
+
+        with open(output_path / f"{filepath.stem}.json", "w") as fp:
+            json.dump(output_obj, fp)
