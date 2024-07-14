@@ -8,6 +8,7 @@ arxiv = "*"
 langchain = "*"
 langchain-community = "*"
 langchain-core = "*"
+pymupdf = "*"
 
 [dev-packages]
 ipykernel = "*"
