@@ -7,6 +7,7 @@ import sys
 import re
 import json
 import pymupdf
+from arxiv.arxiv import SortCriterion
 
 json_parse_prompt = "Return the answer in a valid JSON format, with the key '{key}'. DO NOT return any more content, but ONLY the JSON string. Remember to escape double quotes by using backslash (\)."
 
@@ -87,8 +88,15 @@ def clean_json_string(json_string: str) -> str:
 
 
 def build_search_string(title: str, abstract: str, keywords: str) -> str:
-    task_prompt = "Here are the title, abstract and keywords of a research paper: \nTitle: {title}\nAbstract: {abstract}\nKeywords: {keywords}.\n\nBuild a search string to use in a search engine for research papers, in order to find relevant papers related to this specific article."
+    task_prompt = """Here are the title, abstract and keywords of a research paper:
+    Title: {title}
+    Abstract: {abstract}
+    Keywords: {keywords}
 
+    Your job is to build a search string to use in a search engine for research papers, in order to find relevant papers related to this specific one, following the steps:
+    1. Read the keywords and select the relevant ones based on the context of the title and the abstract.
+    2. If necessary you can add more keywords related to the subject to expand the search.
+    3. Use the selected keywords and combine them by using the operators AND and OR to get more related results and expand the search."""
     llm = Ollama(model="llama3")
 
     prompt = (
@@ -102,7 +110,9 @@ def build_search_string(title: str, abstract: str, keywords: str) -> str:
     return cleaned
 
 
-def arxiv_search(search_string: str, max_results: int) -> List[Document]:
+def arxiv_search(
+    search_string: str, max_results: int, sorting="relevance"
+) -> List[Document]:
     arxiv = ArxivAPIWrapper(
         top_k_results=max_results,
         ARXIV_MAX_QUERY_LENGTH=300,
@@ -111,7 +121,15 @@ def arxiv_search(search_string: str, max_results: int) -> List[Document]:
         doc_content_chars_max=40000,
     )
 
-    results = arxiv.arxiv_search(search_string, max_results=max_results).results()
+    sort_by = {
+        "relevance": SortCriterion.Relevance,
+        "submitted-date": SortCriterion.SubmittedDate,
+        "last-updated": SortCriterion.LastUpdatedDate,
+    }
+
+    results = arxiv.arxiv_search(
+        search_string, max_results=max_results, sort_by=sort_by[sorting]
+    ).results()
 
     return [
         Document(
@@ -127,48 +145,88 @@ def arxiv_search(search_string: str, max_results: int) -> List[Document]:
     ]
 
 
+def safe_read_search_str(json_str: str) -> str:
+    try:
+        return json.loads(json_str)["search_string"].replace('"', "").strip()
+    except:
+        match = re.search('"search_string":\s?".*"', json_str, flags=re.DOTALL)
+        if match:
+            return (
+                match.group().replace('"search_string":', "").replace('"', "").strip()
+            )
+        raise Exception("Error parsing JSON string")
+
+
+def parse_doc(doc):
+    return {
+        "Summary": doc.page_content,
+        "Entry ID": doc.metadata["Entry ID"],
+        "Published": str(doc.metadata["Published"]),
+        "Title": doc.metadata["Title"],
+        "Authors": doc.metadata["Authors"],
+    }
+
+
+def extract_features(first_page) -> dict:
+    title = get_block_text(get_title_block(first_page))
+    blocks = first_page.get_text("blocks", sort=True)
+    text_blocks = [b[4] for b in blocks]
+
+    keywords_i, keywords_start, keywords_end = get_text_block_match(
+        "key\s?words", text_blocks
+    )
+    keywords_value = get_key_value(
+        text_blocks, keywords_i, keywords_start, keywords_end
+    )
+
+    abstract_i, abstract_start, abstract_end = get_text_block_match(
+        "abstract", text_blocks
+    )
+    abstract_value = get_key_value(
+        text_blocks, abstract_i, abstract_start, abstract_end
+    )
+
+    return {"title": title, "keywords": keywords_value, "abstract": abstract_value}
+
+
+def search_pipeline(filepath):
+    doc = pymupdf.open(filepath)
+    features = extract_features(first_page=doc[0])
+
+    search_json_string = build_search_string(
+        title=features["title"],
+        abstract=features["abstract"],
+        keywords=features["keywords"],
+    )
+    search_string = safe_read_search_str(search_json_string)
+    related = arxiv_search(search_string=search_string, max_results=5)
+    return related
+
+
 if __name__ == "__main__":
     input_path = Path(sys.argv[1])
-    abstract_re = "abstract"
-    keywords_re = "key\s?words"
     output_path = Path("./output")
     output_path.mkdir(exist_ok=True)
 
     for filepath in input_path.glob("*.pdf"):
-        print("filename:", filepath.name)
-
         doc = pymupdf.open(filepath)
-        blocks = doc[0].get_text("blocks", sort=True)
-        text_blocks = [b[4] for b in blocks]
+        features = extract_features(doc[0])
+        
+        search_json_string = build_search_string(
+            title=features["title"],
+            abstract=features["abstract"],
+            keywords=features["keywords"],
+        )
 
-        title = get_block_text(get_title_block(doc[0]))
-        print("title:", title)
-
-        keywords_i, keywords_start, keywords_end = get_text_block_match(
-            keywords_re, text_blocks
-        )
-        keywords_value = get_key_value(
-            text_blocks, keywords_i, keywords_start, keywords_end
-        )
-        print("keywords:", keywords_value)
-
-        abstract_i, abstract_start, abstract_end = get_text_block_match(
-            abstract_re, text_blocks
-        )
-        abstract_value = get_key_value(
-            text_blocks, abstract_i, abstract_start, abstract_end
-        )
-        print("abstract:", abstract_value)
-
-        search_string = build_search_string(
-            title=title, abstract=abstract_value, keywords=keywords_value
-        )
+        search_string = safe_read_search_str(search_json_string)
+        related_papers = arxiv_search(search_string=search_string, max_results=5)
 
         output_obj = {
-            "title": title,
-            "abstract": abstract_value,
-            "keywords": keywords_value,
-            "search_string": search_string
+            "title": features["title"],
+            "abstract": features["abstract"],
+            "keywords": features["keywords"],
+            "search_string": search_string,
+            "papers": [parse_doc(doc) for doc in related_papers],
         }
         print()
 
